@@ -16,7 +16,7 @@
 
 package org.springframework.xd.dirt.launcher;
 
-import java.io.File;
+import java.util.Properties;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -30,10 +30,13 @@ import org.springframework.context.support.ClassPathXmlApplicationContext;
 import org.springframework.data.redis.RedisConnectionFailureException;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.support.atomic.RedisAtomicLong;
-import org.springframework.util.StringUtils;
+import org.springframework.util.Assert;
 import org.springframework.xd.dirt.container.DefaultContainer;
 import org.springframework.xd.dirt.core.Container;
 import org.springframework.xd.dirt.event.ContainerStartedEvent;
+import org.springframework.xd.dirt.server.options.ContainerOptions;
+import org.springframework.xd.dirt.server.options.OptionUtils;
+import org.springframework.xd.dirt.server.util.BannerUtils;
 
 /**
  * @author Mark Fisher
@@ -42,14 +45,17 @@ import org.springframework.xd.dirt.event.ContainerStartedEvent;
  */
 public class RedisContainerLauncher implements ContainerLauncher, ApplicationEventPublisherAware {
 
-	private final RedisAtomicLong ids;
+	private final RedisConnectionFactory connectionFactory;
+
+	private volatile RedisAtomicLong ids;
 
 	private volatile ApplicationEventPublisher eventPublisher;
 
 	private static Log logger = LogFactory.getLog(RedisContainerLauncher.class);
 
 	public RedisContainerLauncher(RedisConnectionFactory connectionFactory) {
-		this.ids = new RedisAtomicLong("idsequence", connectionFactory);
+		Assert.notNull(connectionFactory, "connectionFactory must not be null");
+		this.connectionFactory = connectionFactory;
 	}
 
 	@Override
@@ -58,20 +64,54 @@ public class RedisContainerLauncher implements ContainerLauncher, ApplicationEve
 	}
 
 	@Override
-	public Container launch() {
+	public Container launch(ContainerOptions options) {
+		synchronized (this) {
+			if (this.ids == null) {
+				this.ids = new RedisAtomicLong("idsequence", this.connectionFactory);
+			}
+		}
 		long id = ids.incrementAndGet();
 		DefaultContainer container = new DefaultContainer(id + "");
 		container.start();
+		logRedisInfo(container, options);
 		container.addListener(new ShutdownListener(container));
 		this.eventPublisher.publishEvent(new ContainerStartedEvent(container));
 		return container;
 	}
 
-	public static void main(String[] args) {
-		setXDProperties(args);
+	private void logRedisInfo(Container container, ContainerOptions options) {
+		if (logger.isInfoEnabled()) {
+			final Properties redisInfo = this.connectionFactory.getConnection().info();
+			final StringBuilder runtimeInfo = new StringBuilder();
+			runtimeInfo.append(String.format("Using Redis v%s (Mode: %s) on port: %s ",
+						redisInfo.getProperty("redis_version"),
+						redisInfo.getProperty("redis_mode"),
+						redisInfo.getProperty("tcp_port")));
+			if (options.isJmxDisabled()) {
+				runtimeInfo.append(" JMX is disabled for XD components");
+			} else {
+				runtimeInfo.append(String.format(" JMX port: %d", options.getJmxPort()));
+			}
+			logger.info(BannerUtils.displayBanner(container.getJvmName(), runtimeInfo.toString()));
+		}
+	}
+
+	/**
+	 * Create a container instance
+	 * @param options
+	 */
+	@SuppressWarnings("resource")
+	public static Container create(ContainerOptions options) {
 		ClassPathXmlApplicationContext context = null;
 		try {
-			context = new ClassPathXmlApplicationContext(LAUNCHER_CONFIG_LOCATION);
+			context = new ClassPathXmlApplicationContext();
+			context.setConfigLocation(LAUNCHER_CONFIG_LOCATION);
+			//TODO: Need to sort out how this will be handled consistently among launchers
+			if (!options.isJmxDisabled()) {
+				context.getEnvironment().addActiveProfile("xd.jmx.enabled");
+				OptionUtils.setJmxProperties(options, context.getEnvironment());
+			}
+			context.refresh();
 		}
 		catch (BeanCreationException e) {
 			if (e.getCause() instanceof RedisConnectionFailureException) {
@@ -83,28 +123,9 @@ public class RedisContainerLauncher implements ContainerLauncher, ApplicationEve
 		}
 		context.registerShutdownHook();
 		ContainerLauncher launcher = context.getBean(ContainerLauncher.class);
-		launcher.launch();
+		Container container = launcher.launch(options);
+		return container;
 	}
-
-	/**
-	 * Set xd.home and xd.transport system properties
-	 * @param args
-	 */
-	private static void setXDProperties(String[] args) {
-		String xdhome = System.getProperty("xd.home");
-		if (!StringUtils.hasText(xdhome)) {
-			xdhome = (args.length > 0) ? args[0] : "..";
-			System.setProperty("xd.home", xdhome);
-		}
-		String xdtransport = System.getProperty("xd.transport");
-		if (!StringUtils.hasText(xdtransport)) {
-			xdtransport = (args.length > 1) ? args[1] : "redis";
-			System.setProperty("xd.transport", xdtransport);
-		}
-		logger.info("xd.home=" + new File(xdhome).getAbsolutePath()
-				+ ", xd.transport=" + xdtransport);
-	}
-
 
 	private static class ShutdownListener implements ApplicationListener<ContextClosedEvent> {
 
@@ -119,5 +140,4 @@ public class RedisContainerLauncher implements ContainerLauncher, ApplicationEve
 			container.stop();
 		}
 	}
-
 }
